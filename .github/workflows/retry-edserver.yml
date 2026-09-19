@@ -1,21 +1,38 @@
-name: Test OCI Apply
+name: OCI edserver Capacity Retry
 
 on:
+  # Επιτρέπει να εκτελούμε το workflow χειροκίνητα.
   workflow_dispatch:
+
+  # Αυτόματη εκτέλεση κάθε 5 λεπτά.
+  schedule:
+    - cron: '*/5 * * * *'
+
+# Δεν επιτρέπουμε δύο executions αυτού του workflow ταυτόχρονα.
+concurrency:
+  group: oci-edserver-capacity-retry
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  test-apply:
+  retry-edserver:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ------------------------------------------------------------
+      # 1. Εγκατάσταση OCI CLI
+      # ------------------------------------------------------------
       - name: Install OCI CLI
         run: |
           python -m pip install --upgrade pip
           pip install oci-cli
 
+      # ------------------------------------------------------------
+      # 2. Δημιουργία του OCI configuration
+      # ------------------------------------------------------------
       - name: Configure OCI CLI
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
@@ -25,7 +42,9 @@ jobs:
           OCI_REGION: ${{ vars.OCI_REGION }}
         run: |
           mkdir -p ~/.oci
+
           printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+
           chmod 600 ~/.oci/oci_api_key.pem
 
           cat > ~/.oci/config <<EOF
@@ -39,24 +58,107 @@ jobs:
 
           chmod 600 ~/.oci/config
 
-      - name: Verify Resource Manager stack
+      # ------------------------------------------------------------
+      # 3. Ελέγχουμε την κατάσταση των προηγούμενων APPLY jobs
+      # ------------------------------------------------------------
+      - name: Check previous Apply jobs
+        id: check
         env:
           OCI_STACK_ID: ${{ vars.OCI_STACK_ID }}
         run: |
-          echo "Verifying Resource Manager stack..."
+          echo "Checking previous Resource Manager jobs..."
 
-          oci resource-manager stack get \
+          # --------------------------------------------------------
+          # Έλεγχος 1:
+          # Υπάρχει ήδη επιτυχημένο APPLY;
+          #
+          # Αν ναι, η VM έχει ήδη δημιουργηθεί επιτυχώς και δεν
+          # πρέπει να γίνει καμία νέα προσπάθεια.
+          # --------------------------------------------------------
+
+          SUCCESS_COUNT=$(oci resource-manager job list \
             --stack-id "$OCI_STACK_ID" \
-            --query 'data.{name:"display-name",state:"lifecycle-state"}' \
-            --output table
+            --operation APPLY \
+            --lifecycle-state SUCCEEDED \
+            --all \
+            --query 'length(data)' \
+            --raw-output)
 
-      - name: Start one Apply job
+          echo "Successful APPLY jobs: $SUCCESS_COUNT"
+
+          if [ "$SUCCESS_COUNT" -gt 0 ]; then
+            echo "A successful APPLY already exists."
+            echo "No new Apply job will be created."
+            echo "should_apply=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --------------------------------------------------------
+          # Έλεγχος 2:
+          # Υπάρχει APPLY που εκτελείται αυτή τη στιγμή;
+          #
+          # Αν ναι, περιμένουμε. Δεν δημιουργούμε δεύτερο job.
+          # --------------------------------------------------------
+
+          ACCEPTED_COUNT=$(oci resource-manager job list \
+            --stack-id "$OCI_STACK_ID" \
+            --operation APPLY \
+            --lifecycle-state ACCEPTED \
+            --all \
+            --query 'length(data)' \
+            --raw-output)
+
+          IN_PROGRESS_COUNT=$(oci resource-manager job list \
+            --stack-id "$OCI_STACK_ID" \
+            --operation APPLY \
+            --lifecycle-state IN_PROGRESS \
+            --all \
+            --query 'length(data)' \
+            --raw-output)
+
+          echo "Accepted APPLY jobs: $ACCEPTED_COUNT"
+          echo "In-progress APPLY jobs: $IN_PROGRESS_COUNT"
+
+          if [ "$ACCEPTED_COUNT" -gt 0 ] || [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
+            echo "An APPLY job is already running."
+            echo "No new Apply job will be created."
+            echo "should_apply=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --------------------------------------------------------
+          # Δεν υπάρχει ούτε successful ούτε active APPLY.
+          # Επιτρέπουμε νέα προσπάθεια.
+          # --------------------------------------------------------
+
+          echo "No successful or active APPLY job found."
+          echo "A new capacity attempt is allowed."
+
+          echo "should_apply=true" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 4. Δημιουργία νέου APPLY μόνο όταν χρειάζεται
+      # ------------------------------------------------------------
+      - name: Start new Apply job
+        if: steps.check.outputs.should_apply == 'true'
         env:
           OCI_STACK_ID: ${{ vars.OCI_STACK_ID }}
         run: |
-          echo "Starting one AUTO_APPROVED Apply job..."
+          echo "Starting a new Resource Manager AUTO_APPROVED Apply..."
+
+          JOB_NAME="github-capacity-retry-$(date -u +%Y%m%dT%H%M%SZ)"
 
           oci resource-manager job create-apply-job \
             --stack-id "$OCI_STACK_ID" \
             --execution-plan-strategy AUTO_APPROVED \
-            --display-name "github-edserver-test-apply"
+            --display-name "$JOB_NAME"
+
+          echo "Apply job submitted: $JOB_NAME"
+
+      # ------------------------------------------------------------
+      # 5. Μήνυμα όταν δεν χρειάζεται νέα προσπάθεια
+      # ------------------------------------------------------------
+      - name: No retry required
+        if: steps.check.outputs.should_apply == 'false'
+        run: |
+          echo "No new Apply job was submitted."
