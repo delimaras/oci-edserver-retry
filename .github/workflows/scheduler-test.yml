@@ -1,0 +1,16 @@
+name: Scheduler Test
+
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+
+jobs:
+  scheduler-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Confirm scheduled execution
+        run: |
+          echo "GitHub scheduler fired successfully."
+          echo "UTC time:"
+          date -u
