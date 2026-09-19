@@ -1,19 +1,19 @@
 name: OCI edserver Capacity Retry
 
 on:
-  # Χειροκίνητη εκτέλεση από το GitHub Actions.
+  # Χειροκίνητη εκτέλεση.
   workflow_dispatch:
 
   # Αυτόματη εκτέλεση κάθε 5 λεπτά.
   schedule:
     - cron: '*/5 * * * *'
 
-# Δεν επιτρέπουμε δύο executions του ίδιου workflow ταυτόχρονα.
+# Αποτρέπει δύο GitHub runs του συγκεκριμένου workflow
+# από το να εκτελούνται ταυτόχρονα.
 concurrency:
   group: oci-edserver-capacity-retry
   cancel-in-progress: false
 
-# Το workflow χρειάζεται μόνο read access στο repository.
 permissions:
   contents: read
 
@@ -44,12 +44,10 @@ jobs:
         run: |
           mkdir -p ~/.oci
 
-          # Αποθήκευση του private API signing key.
           printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
 
           chmod 600 ~/.oci/oci_api_key.pem
 
-          # Δημιουργία OCI CLI configuration.
           cat > ~/.oci/config <<EOF
           [DEFAULT]
           user=$OCI_USER_OCID
@@ -62,7 +60,7 @@ jobs:
           chmod 600 ~/.oci/config
 
       # ============================================================
-      # 3. Έλεγχος προηγούμενων Resource Manager APPLY jobs
+      # 3. Έλεγχος προηγούμενων Resource Manager jobs
       # ============================================================
       - name: Check previous Apply jobs
         id: check
@@ -72,93 +70,104 @@ jobs:
           echo "Checking previous Resource Manager jobs..."
 
           # --------------------------------------------------------
-          # Έλεγχος 1:
-          # Υπάρχει ήδη επιτυχημένο APPLY;
-          #
-          # Αν υπάρχει, θεωρούμε ότι το Terraform ολοκλήρωσε
-          # επιτυχώς τη δημιουργία του instance και δεν πρέπει
-          # να γίνει νέα προσπάθεια.
+          # Παίρνουμε ΟΛΑ τα jobs του συγκεκριμένου stack μία φορά.
           # --------------------------------------------------------
 
-          SUCCESS_COUNT=$(oci resource-manager job list \
+          oci resource-manager job list \
             --stack-id "$OCI_STACK_ID" \
-            --lifecycle-state SUCCEEDED \
             --all \
-            --query 'length(data[?operation==`APPLY`])' \
-            --raw-output)
-
-          echo "Successful APPLY jobs: $SUCCESS_COUNT"
-
-          if [ "$SUCCESS_COUNT" -gt 0 ]; then
-            echo "A successful APPLY already exists."
-            echo "The instance should already have been created."
-            echo "No new Apply job will be submitted."
-
-            echo "should_apply=false" >> "$GITHUB_OUTPUT"
-
-            exit 0
-          fi
+            --output json \
+            > jobs.json
 
           # --------------------------------------------------------
-          # Έλεγχος 2:
-          # Υπάρχει APPLY σε κατάσταση ACCEPTED;
+          # Με Python διαβάζουμε το JSON.
           #
-          # Αυτό σημαίνει ότι η Oracle έχει δεχτεί το job αλλά
-          # δεν έχει αρχίσει ακόμη η εκτέλεσή του.
-          # --------------------------------------------------------
-
-          ACCEPTED_COUNT=$(oci resource-manager job list \
-            --stack-id "$OCI_STACK_ID" \
-            --lifecycle-state ACCEPTED \
-            --all \
-            --query 'length(data[?operation==`APPLY`])' \
-            --raw-output)
-
-          # --------------------------------------------------------
-          # Έλεγχος 3:
-          # Υπάρχει APPLY που εκτελείται ήδη;
-          # --------------------------------------------------------
-
-          IN_PROGRESS_COUNT=$(oci resource-manager job list \
-            --stack-id "$OCI_STACK_ID" \
-            --lifecycle-state IN_PROGRESS \
-            --all \
-            --query 'length(data[?operation==`APPLY`])' \
-            --raw-output)
-
-          echo "Accepted APPLY jobs: $ACCEPTED_COUNT"
-          echo "In-progress APPLY jobs: $IN_PROGRESS_COUNT"
-
-          # --------------------------------------------------------
-          # Αν υπάρχει ενεργό APPLY, δεν δημιουργούμε δεύτερο.
-          # --------------------------------------------------------
-
-          if [ "$ACCEPTED_COUNT" -gt 0 ] || [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
-            echo "An APPLY job is already active."
-            echo "No new Apply job will be submitted."
-
-            echo "should_apply=false" >> "$GITHUB_OUTPUT"
-
-            exit 0
-          fi
-
-          # --------------------------------------------------------
-          # Αν φτάσαμε εδώ:
+          # Μετράμε αποκλειστικά jobs των οποίων:
           #
-          # - δεν υπάρχει successful APPLY
-          # - δεν υπάρχει accepted APPLY
-          # - δεν υπάρχει APPLY σε εξέλιξη
+          # operation == APPLY
           #
-          # Άρα επιτρέπεται νέα προσπάθεια.
+          # και ελέγχουμε τα lifecycle states:
+          #
+          # SUCCEEDED
+          # ACCEPTED
+          # IN_PROGRESS
           # --------------------------------------------------------
 
-          echo "No successful or active APPLY job found."
-          echo "A new capacity attempt is allowed."
+          python <<'PY'
+          import json
+          import os
 
-          echo "should_apply=true" >> "$GITHUB_OUTPUT"
+          with open("jobs.json", "r", encoding="utf-8") as f:
+              response = json.load(f)
+
+          jobs = response.get("data", [])
+
+          apply_jobs = [
+              job
+              for job in jobs
+              if job.get("operation") == "APPLY"
+          ]
+
+          successful = [
+              job
+              for job in apply_jobs
+              if job.get("lifecycle-state") == "SUCCEEDED"
+          ]
+
+          accepted = [
+              job
+              for job in apply_jobs
+              if job.get("lifecycle-state") == "ACCEPTED"
+          ]
+
+          in_progress = [
+              job
+              for job in apply_jobs
+              if job.get("lifecycle-state") == "IN_PROGRESS"
+          ]
+
+          print(f"Total APPLY jobs: {len(apply_jobs)}")
+          print(f"Successful APPLY jobs: {len(successful)}")
+          print(f"Accepted APPLY jobs: {len(accepted)}")
+          print(f"In-progress APPLY jobs: {len(in_progress)}")
+
+          # --------------------------------------------------------
+          # Απόφαση για το αν επιτρέπεται νέο APPLY.
+          # --------------------------------------------------------
+
+          if successful:
+              print()
+              print("A successful APPLY already exists.")
+              print("No new Apply job will be submitted.")
+
+              should_apply = "false"
+
+          elif accepted or in_progress:
+              print()
+              print("An APPLY job is already active.")
+              print("No new Apply job will be submitted.")
+
+              should_apply = "false"
+
+          else:
+              print()
+              print("No successful or active APPLY job found.")
+              print("A new capacity attempt is allowed.")
+
+              should_apply = "true"
+
+          # --------------------------------------------------------
+          # Στέλνουμε το αποτέλεσμα στο επόμενο GitHub Actions step.
+          # --------------------------------------------------------
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+
+          with open(github_output, "a", encoding="utf-8") as f:
+              f.write(f"should_apply={should_apply}\n")
+          PY
 
       # ============================================================
-      # 4. Νέα προσπάθεια δημιουργίας του instance
+      # 4. Δημιουργία νέου Apply job μόνο όταν επιτρέπεται
       # ============================================================
       - name: Start new Apply job
         if: steps.check.outputs.should_apply == 'true'
@@ -167,23 +176,22 @@ jobs:
         run: |
           echo "Starting a new Resource Manager AUTO_APPROVED Apply..."
 
-          # Μοναδικό όνομα για κάθε προσπάθεια.
           JOB_NAME="github-capacity-retry-$(date -u +%Y%m%dT%H%M%SZ)"
 
-          # Δημιουργία νέου Resource Manager Apply job.
           oci resource-manager job create-apply-job \
             --stack-id "$OCI_STACK_ID" \
             --execution-plan-strategy AUTO_APPROVED \
             --display-name "$JOB_NAME"
 
+          echo
           echo "Apply job submitted successfully."
           echo "Job name: $JOB_NAME"
 
       # ============================================================
-      # 5. Δεν χρειάζεται νέα προσπάθεια
+      # 5. Δεν απαιτείται νέα προσπάθεια
       # ============================================================
       - name: No retry required
         if: steps.check.outputs.should_apply == 'false'
         run: |
           echo "No new Apply job was submitted."
-          echo "Either an APPLY is already running or an APPLY has already succeeded."
+          echo "An APPLY is already active or one has already succeeded."
